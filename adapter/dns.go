@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"net/netip"
+	"time"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -21,6 +22,7 @@ type DNSRouter interface {
 	ClearCache()
 	LookupReverseMapping(ip netip.Addr) (string, bool)
 	ResetNetwork()
+	AppendDNSTracker(tracker DNSTracker)
 }
 
 type DNSClient interface {
@@ -91,4 +93,20 @@ type DNSTransportManager interface {
 	FakeIP() FakeIPTransport
 	Remove(tag string) error
 	Create(ctx context.Context, logger log.ContextLogger, tag string, outboundType string, options any) error
+}
+
+type DNSTracker interface {
+	ObserveDNSQuery(ctx context.Context, observation DNSQueryObservation)
+}
+
+type DNSQueryObservation struct {
+	Metadata  *InboundContext
+	Question  dns.Question
+	Transport DNSTransport
+	Rule      DNSRule
+	Options   DNSQueryOptions
+	Cached    bool
+	Duration  time.Duration
+	Err       error
+	RCode     int
 }

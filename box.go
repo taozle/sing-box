@@ -24,6 +24,7 @@ import (
 	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/experimental/libbox/platform"
 	"github.com/sagernet/sing-box/log"
+	metricsPrometheus "github.com/sagernet/sing-box/metrics/prometheus"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing-box/route"
@@ -196,6 +197,18 @@ func New(options Options) (*Box, error) {
 	err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
 	if err != nil {
 		return nil, E.Cause(err, "initialize router")
+	}
+	if experimentalOptions.Debug != nil && experimentalOptions.Debug.Prometheus != nil {
+		exporter, err := metricsPrometheus.NewExporter(
+			logFactory.NewLogger("metrics/prometheus"),
+			router,
+			dnsRouter,
+			*experimentalOptions.Debug.Prometheus,
+		)
+		if err != nil {
+			return nil, E.Cause(err, "create prometheus exporter")
+		}
+		internalServices = append(internalServices, adapter.NewLifecycleService(exporter, "prometheus metrics exporter"))
 	}
 	ntpOptions := common.PtrValueOrDefault(options.NTP)
 	var timeService *tls.TimeServiceWrapper
