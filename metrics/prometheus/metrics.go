@@ -3,77 +3,44 @@ package prometheus
 import (
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-)
-
-var (
-	connectionLabelNames = []string{"network", "inbound", "inbound_type", "outbound", "outbound_type", "rule"}
-	trafficLabelNames    = []string{"direction", "network", "inbound", "inbound_type", "outbound", "outbound_type", "rule"}
-	connectionBuckets    = []float64{0.25, 1, 5, 15, 60, 300, 900, 3600, 21600, 86400}
-
-	dnsRequestLabelNames  = []string{"server", "server_type", "rule", "cache", "rcode", "qtype"}
-	dnsDurationLabelNames = []string{"server", "server_type", "rule", "rcode", "qtype"}
-)
-
-const (
-	labelValueUnknown = "unknown"
-	labelValueDefault = "default"
-	labelValueNone    = "none"
-	labelValueCache   = "cache"
-	labelValueError   = "error"
-	directionUplink   = "uplink"
-	directionDownlink = "downlink"
-
-	cacheLabelHit  = "hit"
-	cacheLabelMiss = "miss"
-
-	dnsTopDomainLimit    = 10
-	dnsMaxTrackedDomains = 256
+	"github.com/miekg/dns"
+	promlib "github.com/prometheus/client_golang/prometheus"
+	"github.com/sagernet/sing-box/adapter"
 )
 
 type metricsSet struct {
-	connections      *prometheus.GaugeVec
-	connectionsTotal *prometheus.CounterVec
-	durations        *prometheus.HistogramVec
-	trafficBytes     *prometheus.CounterVec
+	connections      *promlib.GaugeVec
+	connectionsTotal *promlib.CounterVec
+	durations        *promlib.HistogramVec
+	trafficBytes     *promlib.CounterVec
 }
 
-type dnsMetricsSet struct {
-	requests   *prometheus.CounterVec
-	durations  *prometheus.HistogramVec
-	topDomains *prometheus.GaugeVec
-
-	access         sync.Mutex
-	domainCounts   map[string]uint64
-	topDomainRanks map[int]string
-}
-
-func newMetricsSet(registry *prometheus.Registry) *metricsSet {
+func newMetricsSet(registry *promlib.Registry) *metricsSet {
 	metrics := &metricsSet{
-		connections: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		connections: promlib.NewGaugeVec(promlib.GaugeOpts{
 			Namespace: "sing_box",
-			Name:      "connections",
-			Help:      "Number of active routed connections.",
-		}, connectionLabelNames),
-		connectionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name:      "active_connections",
+			Help:      "Number of active proxy connections",
+		}, []string{"inbound", "inbound_type", "outbound", "outbound_type", "rule", "network"}),
+		connectionsTotal: promlib.NewCounterVec(promlib.CounterOpts{
 			Namespace: "sing_box",
 			Name:      "connections_total",
-			Help:      "Total number of routed connections.",
-		}, connectionLabelNames),
-		durations: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Help:      "Total number of proxy connections created",
+		}, []string{"inbound", "inbound_type", "outbound", "outbound_type", "rule", "network"}),
+		durations: promlib.NewHistogramVec(promlib.HistogramOpts{
 			Namespace: "sing_box",
 			Name:      "connection_duration_seconds",
-			Help:      "Connection duration distribution.",
-			Buckets:   connectionBuckets,
-		}, connectionLabelNames),
-		trafficBytes: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Help:      "Duration of proxy connections in seconds",
+		}, []string{"inbound", "inbound_type", "outbound", "outbound_type", "rule", "network"}),
+		trafficBytes: promlib.NewCounterVec(promlib.CounterOpts{
 			Namespace: "sing_box",
-			Name:      "traffic_bytes_total",
-			Help:      "Traffic volume of routed connections.",
-		}, trafficLabelNames),
+			Name:      "connection_bytes_total",
+			Help:      "Traffic volume by proxy connection direction",
+		}, []string{"inbound", "inbound_type", "outbound", "outbound_type", "rule", "network", "direction"}),
 	}
 	registry.MustRegister(metrics.connections, metrics.connectionsTotal, metrics.durations, metrics.trafficBytes)
 	return metrics
@@ -89,113 +56,188 @@ func (m *metricsSet) observeConnectionClose(labels []string, duration time.Durat
 	m.durations.WithLabelValues(labels...).Observe(duration.Seconds())
 }
 
-func (m *metricsSet) observeTraffic(labels []string, bytes int64) {
+func (m *metricsSet) observeTraffic(labels []string, direction string, bytes int64) {
 	if bytes <= 0 {
 		return
 	}
-	m.trafficBytes.WithLabelValues(labels...).Add(float64(bytes))
+	values := append(append([]string(nil), labels...), direction)
+	m.trafficBytes.WithLabelValues(values...).Add(float64(bytes))
 }
 
-func newDNSMetricsSet(registry *prometheus.Registry) *dnsMetricsSet {
+type dnsMetricsSet struct {
+	requests   *promlib.CounterVec
+	durations  *promlib.HistogramVec
+	topDomains *topDomainTracker
+}
+
+func newDNSMetricsSet(registry *promlib.Registry) *dnsMetricsSet {
 	metrics := &dnsMetricsSet{
-		requests: prometheus.NewCounterVec(prometheus.CounterOpts{
+		requests: promlib.NewCounterVec(promlib.CounterOpts{
 			Namespace: "sing_box",
 			Name:      "dns_requests_total",
-			Help:      "Total number of DNS requests handled by the router.",
-		}, dnsRequestLabelNames),
-		durations: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Help:      "Number of DNS queries handled by the proxy",
+		}, []string{"inbound", "inbound_type", "transport", "transport_type", "rule", "rcode", "qtype", "cached"}),
+		durations: promlib.NewHistogramVec(promlib.HistogramOpts{
 			Namespace: "sing_box",
 			Name:      "dns_request_duration_seconds",
-			Help:      "DNS request duration distribution.",
-			Buckets:   []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
-		}, dnsDurationLabelNames),
-		topDomains: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Namespace: "sing_box",
-			Name:      "dns_top_domain_requests_total",
-			Help:      "Top DNS query domains ranked by request count.",
-		}, []string{"rank", "domain"}),
-		domainCounts:   make(map[string]uint64),
-		topDomainRanks: make(map[int]string),
+			Help:      "Latency of proxied DNS queries in seconds",
+		}, []string{"inbound", "inbound_type", "transport", "transport_type", "rule", "rcode", "qtype", "cached"}),
 	}
-	registry.MustRegister(metrics.requests, metrics.durations, metrics.topDomains)
+	metrics.topDomains = newTopDomainTracker(registry)
+	registry.MustRegister(metrics.requests, metrics.durations, metrics.topDomains.gauge)
 	return metrics
 }
 
-func (m *dnsMetricsSet) observe(cacheLabel, server, serverType, rule, rcode, qtype, domain string, duration time.Duration, cached bool) {
-	m.requests.WithLabelValues(server, serverType, rule, cacheLabel, rcode, qtype).Inc()
-	if !cached {
-		m.durations.WithLabelValues(server, serverType, rule, rcode, qtype).Observe(duration.Seconds())
+func (m *dnsMetricsSet) observe(observation adapter.DNSQueryObservation) {
+	metadata := observation.Metadata
+	inbound := "-"
+	inboundType := "-"
+	if metadata != nil {
+		if metadata.Inbound != "" {
+			inbound = metadata.Inbound
+		}
+		if metadata.InboundType != "" {
+			inboundType = metadata.InboundType
+		}
 	}
-	if domain != "" {
-		m.updateTopDomains(domain)
+	transport := "-"
+	transportType := "-"
+	if observation.Transport != nil {
+		transport = safeLabel(observation.Transport.Tag())
+		transportType = safeLabel(observation.Transport.Type())
+	}
+	rule := "-"
+	if observation.Rule != nil {
+		rule = safeLabel(observation.Rule.Type())
+	}
+	rcode := rcodeLabel(observation)
+	qtype := questionType(observation.Question.Qtype)
+	cached := boolLabel(observation.Cached)
+	labels := []string{inbound, inboundType, transport, transportType, rule, rcode, qtype, cached}
+	m.requests.WithLabelValues(labels...).Inc()
+	if observation.Duration > 0 {
+		m.durations.WithLabelValues(labels...).Observe(observation.Duration.Seconds())
+	}
+	domain := ""
+	if metadata != nil {
+		domain = metadata.Domain
+	}
+	if domain == "" && observation.Question.Name != "" {
+		domain = normalizeDomain(observation.Question.Name)
+	}
+	m.topDomains.Observe(domain)
+}
+
+func safeLabel(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
+func questionType(value uint16) string {
+	if name, ok := dns.TypeToString[value]; ok {
+		return name
+	}
+	return strconvFormatUint(uint64(value))
+}
+
+func boolLabel(value bool) string {
+	if value {
+		return "true"
+	}
+	return "false"
+}
+
+func rcodeLabel(observation adapter.DNSQueryObservation) string {
+	if observation.Err != nil {
+		return "error"
+	}
+	if observation.RCode >= 0 {
+		if name, ok := dns.RcodeToString[observation.RCode]; ok {
+			return name
+		}
+		return strconvFormatUint(uint64(observation.RCode))
+	}
+	return "-"
+}
+
+type topDomainTracker struct {
+	gauge  *promlib.GaugeVec
+	size   int
+	mu     sync.Mutex
+	counts map[string]uint64
+	top    []domainCount
+}
+
+type domainCount struct {
+	domain string
+	count  uint64
+}
+
+func newTopDomainTracker(registry *promlib.Registry) *topDomainTracker {
+	gauge := promlib.NewGaugeVec(promlib.GaugeOpts{
+		Namespace: "sing_box",
+		Name:      "dns_top_domain_requests",
+		Help:      "Top DNS query domains observed by the proxy",
+	}, []string{"domain"})
+	tracker := &topDomainTracker{
+		gauge:  gauge,
+		size:   10,
+		counts: make(map[string]uint64),
+	}
+	return tracker
+}
+
+func (t *topDomainTracker) Observe(domain string) {
+	if domain == "" {
+		return
+	}
+	domain = strings.ToLower(domain)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	count := t.counts[domain] + 1
+	t.counts[domain] = count
+	updated := false
+	for i := range t.top {
+		if t.top[i].domain == domain {
+			t.top[i].count = count
+			updated = true
+			break
+		}
+	}
+	if !updated {
+		if len(t.top) < t.size {
+			t.top = append(t.top, domainCount{domain: domain, count: count})
+			updated = true
+		} else if count > t.top[len(t.top)-1].count {
+			removed := t.top[len(t.top)-1]
+			t.gauge.DeleteLabelValues(removed.domain)
+			t.top[len(t.top)-1] = domainCount{domain: domain, count: count}
+			updated = true
+		}
+	}
+	if updated {
+		sort.Slice(t.top, func(i, j int) bool {
+			if t.top[i].count == t.top[j].count {
+				return t.top[i].domain < t.top[j].domain
+			}
+			return t.top[i].count > t.top[j].count
+		})
+		for _, entry := range t.top {
+			t.gauge.WithLabelValues(entry.domain).Set(float64(entry.count))
+		}
 	}
 }
 
-func (m *dnsMetricsSet) updateTopDomains(domain string) {
-	m.access.Lock()
-	defer m.access.Unlock()
+func normalizeDomain(name string) string {
+	if name == "" {
+		return ""
+	}
+	trimmed := strings.TrimSuffix(name, ".")
+	return strings.ToLower(trimmed)
+}
 
-	if count, exists := m.domainCounts[domain]; exists {
-		m.domainCounts[domain] = count + 1
-	} else {
-		if len(m.domainCounts) >= dnsMaxTrackedDomains {
-			var (
-				minDomain string
-				minCount  uint64
-				found     bool
-			)
-			for existingDomain, existingCount := range m.domainCounts {
-				if !found || existingCount < minCount {
-					minDomain = existingDomain
-					minCount = existingCount
-					found = true
-				}
-			}
-			if found {
-				delete(m.domainCounts, minDomain)
-				for rank, trackedDomain := range m.topDomainRanks {
-					if trackedDomain == minDomain {
-						m.topDomains.DeleteLabelValues(strconv.Itoa(rank), trackedDomain)
-						delete(m.topDomainRanks, rank)
-					}
-				}
-			}
-		}
-		m.domainCounts[domain] = 1
-	}
-
-	type domainEntry struct {
-		domain string
-		count  uint64
-	}
-
-	entries := make([]domainEntry, 0, len(m.domainCounts))
-	for trackedDomain, count := range m.domainCounts {
-		entries = append(entries, domainEntry{domain: trackedDomain, count: count})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].count == entries[j].count {
-			return entries[i].domain < entries[j].domain
-		}
-		return entries[i].count > entries[j].count
-	})
-	if len(entries) > dnsTopDomainLimit {
-		entries = entries[:dnsTopDomainLimit]
-	}
-
-	for rank, entry := range entries {
-		rankIndex := rank + 1
-		labelRank := strconv.Itoa(rankIndex)
-		if previousDomain, exists := m.topDomainRanks[rankIndex]; exists && previousDomain != entry.domain {
-			m.topDomains.DeleteLabelValues(labelRank, previousDomain)
-		}
-		m.topDomains.WithLabelValues(labelRank, entry.domain).Set(float64(entry.count))
-		m.topDomainRanks[rankIndex] = entry.domain
-	}
-	for rank := len(entries) + 1; rank <= dnsTopDomainLimit; rank++ {
-		if previousDomain, exists := m.topDomainRanks[rank]; exists {
-			m.topDomains.DeleteLabelValues(strconv.Itoa(rank), previousDomain)
-			delete(m.topDomainRanks, rank)
-		}
-	}
+func strconvFormatUint(value uint64) string {
+	return strconv.FormatUint(value, 10)
 }

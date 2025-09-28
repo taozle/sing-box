@@ -7,7 +7,8 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing/common/bufio"
+	"github.com/sagernet/sing/common/buf"
+	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
 
@@ -21,146 +22,166 @@ func newTracker(metrics *metricsSet) *metricsTracker {
 
 func (t *metricsTracker) RoutedConnection(_ context.Context, conn net.Conn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) net.Conn {
 	labels := t.connectionLabels(metadata, matchedRule, matchOutbound)
-	return t.wrapConnection(conn, labels)
+	return newMetricsConn(conn, labels, t.metrics)
 }
 
 func (t *metricsTracker) RoutedPacketConnection(_ context.Context, conn N.PacketConn, metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) N.PacketConn {
 	labels := t.connectionLabels(metadata, matchedRule, matchOutbound)
-	return t.wrapPacketConnection(conn, labels)
+	return newMetricsPacketConn(conn, labels, t.metrics)
 }
 
 func (t *metricsTracker) connectionLabels(metadata adapter.InboundContext, matchedRule adapter.Rule, matchOutbound adapter.Outbound) []string {
-	network := metadata.Network
-	if network == "" {
-		network = labelValueUnknown
-	}
-
-	inbound := metadata.Inbound
-	if inbound == "" {
-		if metadata.InboundType != "" {
-			inbound = metadata.InboundType
-		} else {
-			inbound = labelValueDefault
-		}
-	}
-
-	inboundType := metadata.InboundType
-	if inboundType == "" {
-		inboundType = labelValueUnknown
-	}
-
-	outboundTag := labelValueNone
-	outboundType := labelValueUnknown
-	if matchOutbound != nil {
-		outboundTag = matchOutbound.Tag()
-		if outboundTag == "" {
-			outboundTag = labelValueDefault
-		}
-		outboundType = matchOutbound.Type()
-		if outboundType == "" {
-			outboundType = labelValueUnknown
-		}
-	}
-
-	ruleType := labelValueNone
+	inbound := normalize(metadata.Inbound)
+	inboundType := normalize(metadata.InboundType)
+	outbound := normalizeOutbound(metadata, matchOutbound)
+	outboundType := normalizeOutboundType(matchOutbound)
+	rule := "-"
 	if matchedRule != nil {
-		ruleType = matchedRule.Type()
-		if ruleType == "" {
-			ruleType = labelValueUnknown
+		rule = normalize(matchedRule.Type())
+	}
+	network := normalize(metadata.Network)
+	if network == "-" {
+		network = normalize(metadata.Destination.Network())
+	}
+	return []string{inbound, inboundType, outbound, outboundType, rule, network}
+}
+
+func normalize(value string) string {
+	if value == "" {
+		return "-"
+	}
+	return value
+}
+
+func normalizeOutbound(metadata adapter.InboundContext, outbound adapter.Outbound) string {
+	if outbound != nil {
+		if tag := outbound.Tag(); tag != "" {
+			return tag
 		}
+		return normalize(outbound.Type())
 	}
-
-	return []string{network, inbound, inboundType, outboundTag, outboundType, ruleType}
+	if metadata.Outbound != "" {
+		return metadata.Outbound
+	}
+	return "-"
 }
 
-func (t *metricsTracker) wrapConnection(conn net.Conn, labels []string) net.Conn {
-	t.metrics.observeConnectionStart(labels)
-
-	uplinkLabels := make([]string, len(labels)+1)
-	uplinkLabels[0] = directionUplink
-	copy(uplinkLabels[1:], labels)
-
-	downlinkLabels := make([]string, len(labels)+1)
-	downlinkLabels[0] = directionDownlink
-	copy(downlinkLabels[1:], labels)
-
-	counterConn := bufio.NewCounterConn(conn, []N.CountFunc{
-		func(n int64) { t.metrics.observeTraffic(uplinkLabels, n) },
-	}, []N.CountFunc{
-		func(n int64) { t.metrics.observeTraffic(downlinkLabels, n) },
-	})
-
-	return &trackedConn{
-		ExtendedConn: counterConn,
-		metrics:      t.metrics,
-		labels:       labels,
-		start:        time.Now(),
+func normalizeOutboundType(outbound adapter.Outbound) string {
+	if outbound == nil {
+		return "-"
 	}
+	return normalize(outbound.Type())
 }
 
-func (t *metricsTracker) wrapPacketConnection(conn N.PacketConn, labels []string) N.PacketConn {
-	t.metrics.observeConnectionStart(labels)
-
-	uplinkLabels := make([]string, len(labels)+1)
-	uplinkLabels[0] = directionUplink
-	copy(uplinkLabels[1:], labels)
-
-	downlinkLabels := make([]string, len(labels)+1)
-	downlinkLabels[0] = directionDownlink
-	copy(downlinkLabels[1:], labels)
-
-	counterConn := bufio.NewCounterPacketConn(conn, []N.CountFunc{
-		func(n int64) { t.metrics.observeTraffic(uplinkLabels, n) },
-	}, []N.CountFunc{
-		func(n int64) { t.metrics.observeTraffic(downlinkLabels, n) },
-	})
-
-	return &trackedPacketConn{
-		PacketConn: counterConn,
-		metrics:    t.metrics,
-		labels:     labels,
-		start:      time.Now(),
-	}
-}
-
-type trackedConn struct {
-	N.ExtendedConn
+type metricsConn struct {
+	net.Conn
 	metrics   *metricsSet
 	labels    []string
 	start     time.Time
 	closeOnce sync.Once
-	closeErr  error
 }
 
-func (c *trackedConn) Close() error {
+func newMetricsConn(conn net.Conn, labels []string, metrics *metricsSet) net.Conn {
+	wrapper := &metricsConn{
+		Conn:    conn,
+		metrics: metrics,
+		labels:  append([]string(nil), labels...),
+		start:   time.Now(),
+	}
+	metrics.observeConnectionStart(labels)
+	return wrapper
+}
+
+func (c *metricsConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		c.metrics.observeTraffic(c.labels, "uplink", int64(n))
+	}
+	return n, err
+}
+
+func (c *metricsConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		c.metrics.observeTraffic(c.labels, "downlink", int64(n))
+	}
+	return n, err
+}
+
+func (c *metricsConn) Close() error {
+	err := c.Conn.Close()
 	c.closeOnce.Do(func() {
-		c.closeErr = c.ExtendedConn.Close()
 		c.metrics.observeConnectionClose(c.labels, time.Since(c.start))
 	})
-	return c.closeErr
+	return err
 }
 
-func (c *trackedConn) Upstream() any {
-	return c.ExtendedConn
-}
-
-type trackedPacketConn struct {
+type metricsPacketConn struct {
 	N.PacketConn
 	metrics   *metricsSet
 	labels    []string
 	start     time.Time
 	closeOnce sync.Once
-	closeErr  error
 }
 
-func (c *trackedPacketConn) Close() error {
+func newMetricsPacketConn(conn N.PacketConn, labels []string, metrics *metricsSet) N.PacketConn {
+	base := &metricsPacketConn{
+		PacketConn: conn,
+		metrics:    metrics,
+		labels:     append([]string(nil), labels...),
+		start:      time.Now(),
+	}
+	metrics.observeConnectionStart(labels)
+	if netConn, ok := conn.(N.NetPacketConn); ok {
+		return &metricsNetPacketConn{metricsPacketConn: base, netConn: netConn}
+	}
+	return base
+}
+
+func (c *metricsPacketConn) finish() {
 	c.closeOnce.Do(func() {
-		c.closeErr = c.PacketConn.Close()
 		c.metrics.observeConnectionClose(c.labels, time.Since(c.start))
 	})
-	return c.closeErr
 }
 
-func (c *trackedPacketConn) Upstream() any {
-	return c.PacketConn
+func (c *metricsPacketConn) Close() error {
+	err := c.PacketConn.Close()
+	c.finish()
+	return err
+}
+
+func (c *metricsPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
+	destination, err = c.PacketConn.ReadPacket(buffer)
+	if buffer != nil {
+		c.metrics.observeTraffic(c.labels, "uplink", int64(buffer.Len()))
+	}
+	return
+}
+
+func (c *metricsPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+	if buffer != nil {
+		c.metrics.observeTraffic(c.labels, "downlink", int64(buffer.Len()))
+	}
+	return c.PacketConn.WritePacket(buffer, destination)
+}
+
+type metricsNetPacketConn struct {
+	*metricsPacketConn
+	netConn N.NetPacketConn
+}
+
+func (c *metricsNetPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.netConn.ReadFrom(p)
+	if n > 0 {
+		c.metrics.observeTraffic(c.labels, "uplink", int64(n))
+	}
+	return n, addr, err
+}
+
+func (c *metricsNetPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n, err := c.netConn.WriteTo(p, addr)
+	if n > 0 {
+		c.metrics.observeTraffic(c.labels, "downlink", int64(n))
+	}
+	return n, err
 }

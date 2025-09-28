@@ -228,8 +228,29 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 	}
 	question := message.Question[0]
 	r.logger.DebugContext(ctx, "exchange ", FormatQuestion(question.String()))
-
-	ctx, metadata := adapter.ExtendContext(ctx)
+	observation := adapter.DNSQueryObservation{
+		Question: question,
+		Options:  options,
+		RCode:    -1,
+	}
+	start := time.Now()
+	var notify bool
+	defer func() {
+		if !notify {
+			return
+		}
+		if !observation.Cached && observation.Duration == 0 {
+			observation.Duration = time.Since(start)
+		}
+		r.notifyDNSTrackers(ctx, observation)
+	}()
+	response, cached := r.client.ExchangeCache(ctx, message)
+	var metadata *adapter.InboundContext
+	if cached {
+		metadata = &adapter.InboundContext{}
+	} else {
+		ctx, metadata = adapter.ExtendContext(ctx)
+	}
 	metadata.Destination = M.Socksaddr{}
 	metadata.QueryType = question.Qtype
 	switch metadata.QueryType {
@@ -237,37 +258,21 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 		metadata.IPVersion = 4
 	case mDNS.TypeAAAA:
 		metadata.IPVersion = 6
-	default:
-		metadata.IPVersion = 0
 	}
 	metadata.Domain = FqdnToDomain(question.Name)
-
-	response, cached := r.client.ExchangeCache(ctx, message)
-
-	observation := adapter.DNSQueryObservation{
-		Metadata: metadata,
-		Question: question,
-		Options:  options,
+	observation.Metadata = metadata
+	if cached {
+		observation.Cached = true
+		if response != nil {
+			observation.RCode = response.Rcode
+		}
+		notify = true
+		return response, nil
 	}
 	var (
 		transport adapter.DNSTransport
-		rule      adapter.DNSRule
 		err       error
-		record    bool
 	)
-	defer func() {
-		if record {
-			r.notifyDNSTrackers(ctx, observation)
-		}
-	}()
-
-	if cached {
-		observation.Cached = true
-		observation.RCode = response.Rcode
-		record = true
-		return response, nil
-	}
-
 	if options.Transport != nil {
 		transport = options.Transport
 		if legacyTransport, isLegacy := transport.(adapter.LegacyDNSTransport); isLegacy {
@@ -281,20 +286,21 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 		if options.Strategy == C.DomainStrategyAsIS {
 			options.Strategy = r.defaultDomainStrategy
 		}
-		start := time.Now()
-		response, err = r.client.Exchange(ctx, transport, message, options, nil)
-		observation.Options = options
 		observation.Transport = transport
-		observation.Duration = time.Since(start)
+		observation.Options = options
+		exchangeStart := time.Now()
+		response, err = r.client.Exchange(ctx, transport, message, options, nil)
+		observation.Duration = time.Since(exchangeStart)
 		observation.Err = err
 		if response != nil {
 			observation.RCode = response.Rcode
-		} else {
-			observation.RCode = -1
 		}
-		record = true
 	} else {
-		var ruleIndex = -1
+		var (
+			rule      adapter.DNSRule
+			ruleIndex int
+		)
+		ruleIndex = -1
 		for {
 			dnsCtx := adapter.OverrideContext(ctx)
 			dnsOptions := options
@@ -304,6 +310,10 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 				case *R.RuleActionReject:
 					switch action.Method {
 					case C.RuleActionRejectMethodDefault:
+						observation.Rule = rule
+						observation.Err = nil
+						observation.RCode = mDNS.RcodeRefused
+						notify = true
 						return &mDNS.Msg{
 							MsgHdr: mDNS.MsgHdr{
 								Id:       message.Id,
@@ -313,10 +323,20 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 							Question: []mDNS.Question{question},
 						}, nil
 					case C.RuleActionRejectMethodDrop:
+						observation.Rule = rule
+						observation.Err = tun.ErrDrop
+						notify = true
 						return nil, tun.ErrDrop
 					}
 				case *R.RuleActionPredefined:
-					return action.Response(message), nil
+					observation.Rule = rule
+					observation.Err = nil
+					responseMessage := action.Response(message)
+					if responseMessage != nil {
+						observation.RCode = responseMessage.Rcode
+					}
+					notify = true
+					return responseMessage, nil
 				}
 			}
 			var responseCheck func(responseAddrs []netip.Addr) bool
@@ -329,17 +349,15 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 			if dnsOptions.Strategy == C.DomainStrategyAsIS {
 				dnsOptions.Strategy = r.defaultDomainStrategy
 			}
-			start := time.Now()
-			response, err = r.client.Exchange(dnsCtx, transport, message, dnsOptions, responseCheck)
-			observation.Options = dnsOptions
 			observation.Transport = transport
 			observation.Rule = rule
-			observation.Duration = time.Since(start)
+			observation.Options = dnsOptions
+			exchangeStart := time.Now()
+			response, err = r.client.Exchange(dnsCtx, transport, message, dnsOptions, responseCheck)
+			observation.Duration = time.Since(exchangeStart)
 			observation.Err = err
 			if response != nil {
 				observation.RCode = response.Rcode
-			} else {
-				observation.RCode = -1
 			}
 			var rejected bool
 			if err != nil {
@@ -358,9 +376,8 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 			}
 			break
 		}
-		record = true
 	}
-
+	notify = true
 	if err != nil {
 		return nil, err
 	}
@@ -380,39 +397,45 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 }
 
 func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQueryOptions) ([]netip.Addr, error) {
+	observation := adapter.DNSQueryObservation{
+		Question: mDNS.Question{Name: mDNS.Fqdn(domain)},
+		Options:  options,
+		RCode:    -1,
+	}
+	start := time.Now()
+	var notify bool
 	var (
 		responseAddrs []netip.Addr
-		cached        bool
 		err           error
 	)
-	printResult := func() {
-		if err == nil && len(responseAddrs) == 0 {
-			err = E.New("empty result")
+	defer func() {
+		if !notify {
+			return
 		}
-		if err != nil {
-			if errors.Is(err, ErrResponseRejectedCached) {
-				r.logger.DebugContext(ctx, "response rejected for ", domain, " (cached)")
-			} else if errors.Is(err, ErrResponseRejected) {
-				r.logger.DebugContext(ctx, "response rejected for ", domain)
-			} else {
-				r.logger.ErrorContext(ctx, E.Cause(err, "lookup failed for ", domain))
-			}
+		if !observation.Cached && observation.Duration == 0 {
+			observation.Duration = time.Since(start)
 		}
-		if err != nil {
-			err = E.Cause(err, "lookup ", domain)
-		}
-	}
-	responseAddrs, cached = r.client.LookupCache(domain, options.Strategy)
+		r.notifyDNSTrackers(ctx, observation)
+	}()
+	responseAddrs, cached := r.client.LookupCache(domain, options.Strategy)
 	if cached {
+		observation.Cached = true
+		observation.RCode = mDNS.RcodeSuccess
 		if len(responseAddrs) == 0 {
-			return nil, E.New("lookup ", domain, ": empty result (cached)")
+			err = E.New("lookup ", domain, ": empty result (cached)")
+			observation.Err = err
+			notify = true
+			return nil, err
 		}
+		observation.Err = nil
+		notify = true
 		return responseAddrs, nil
 	}
 	r.logger.DebugContext(ctx, "lookup domain ", domain)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Destination = M.Socksaddr{}
 	metadata.Domain = FqdnToDomain(domain)
+	observation.Metadata = metadata
 	if options.Transport != nil {
 		transport := options.Transport
 		if legacyTransport, isLegacy := transport.(adapter.LegacyDNSTransport); isLegacy {
@@ -426,7 +449,15 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 		if options.Strategy == C.DomainStrategyAsIS {
 			options.Strategy = r.defaultDomainStrategy
 		}
+		observation.Transport = transport
+		observation.Options = options
+		lookupStart := time.Now()
 		responseAddrs, err = r.client.Lookup(ctx, transport, domain, options, nil)
+		observation.Duration = time.Since(lookupStart)
+		observation.Err = err
+		if err == nil && len(responseAddrs) > 0 {
+			observation.RCode = mDNS.RcodeSuccess
+		}
 	} else {
 		var (
 			transport adapter.DNSTransport
@@ -443,13 +474,23 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 				case *R.RuleActionReject:
 					switch action.Method {
 					case C.RuleActionRejectMethodDefault:
+						observation.Rule = rule
+						observation.Err = nil
+						observation.RCode = mDNS.RcodeRefused
+						notify = true
 						return nil, nil
 					case C.RuleActionRejectMethodDrop:
+						observation.Rule = rule
+						observation.Err = tun.ErrDrop
+						notify = true
 						return nil, tun.ErrDrop
 					}
 				case *R.RuleActionPredefined:
+					observation.Rule = rule
 					if action.Rcode != mDNS.RcodeSuccess {
 						err = RcodeError(action.Rcode)
+						observation.Err = err
+						observation.RCode = action.Rcode
 					} else {
 						for _, answer := range action.Answer {
 							switch record := answer.(type) {
@@ -459,8 +500,13 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 								responseAddrs = append(responseAddrs, M.AddrFromIP(record.AAAA))
 							}
 						}
+						observation.Err = nil
+						if len(responseAddrs) > 0 {
+							observation.RCode = mDNS.RcodeSuccess
+						}
 					}
-					goto response
+					notify = true
+					goto lookupResponse
 				}
 			}
 			var responseCheck func(responseAddrs []netip.Addr) bool
@@ -473,18 +519,53 @@ func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQ
 			if dnsOptions.Strategy == C.DomainStrategyAsIS {
 				dnsOptions.Strategy = r.defaultDomainStrategy
 			}
+			observation.Transport = transport
+			observation.Rule = rule
+			observation.Options = dnsOptions
+			lookupStart := time.Now()
 			responseAddrs, err = r.client.Lookup(dnsCtx, transport, domain, dnsOptions, responseCheck)
+			observation.Duration = time.Since(lookupStart)
+			observation.Err = err
+			if err == nil && len(responseAddrs) > 0 {
+				observation.RCode = mDNS.RcodeSuccess
+			}
 			if responseCheck == nil || err == nil {
 				break
 			}
-			printResult()
+			if errors.Is(err, ErrResponseRejectedCached) {
+				r.logger.DebugContext(ctx, "response rejected for ", domain, " (cached)")
+			} else if errors.Is(err, ErrResponseRejected) {
+				r.logger.DebugContext(ctx, "response rejected for ", domain)
+			} else {
+				r.logger.ErrorContext(ctx, E.Cause(err, "lookup failed for ", domain))
+			}
+			err = E.Cause(err, "lookup ", domain)
+			observation.Err = err
 		}
 	}
-response:
-	printResult()
+lookupResponse:
+	if err == nil && len(responseAddrs) == 0 {
+		err = E.New("empty result")
+		observation.Err = err
+	}
+	if err != nil {
+		if errors.Is(err, ErrResponseRejectedCached) {
+			r.logger.DebugContext(ctx, "response rejected for ", domain, " (cached)")
+		} else if errors.Is(err, ErrResponseRejected) {
+			r.logger.DebugContext(ctx, "response rejected for ", domain)
+		} else {
+			r.logger.ErrorContext(ctx, E.Cause(err, "lookup failed for ", domain))
+		}
+		err = E.Cause(err, "lookup ", domain)
+		observation.Err = err
+	}
 	if len(responseAddrs) > 0 {
 		r.logger.InfoContext(ctx, "lookup succeed for ", domain, ": ", strings.Join(F.MapToString(responseAddrs), " "))
+		if observation.RCode < 0 {
+			observation.RCode = mDNS.RcodeSuccess
+		}
 	}
+	notify = true
 	return responseAddrs, err
 }
 

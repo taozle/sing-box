@@ -1,3 +1,4 @@
 module github.com/prometheus/client_golang
 
-go 1.24.0
+go 1.20
+

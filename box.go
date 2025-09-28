@@ -127,7 +127,8 @@ func New(options Options) (*Box, error) {
 
 	ctx = pause.WithDefaultManager(ctx)
 	experimentalOptions := common.PtrValueOrDefault(options.Experimental)
-	applyDebugOptions(common.PtrValueOrDefault(experimentalOptions.Debug))
+	debugOptions := common.PtrValueOrDefault(experimentalOptions.Debug)
+	applyDebugOptions(debugOptions)
 	var needCacheFile bool
 	var needClashAPI bool
 	var needV2RayAPI bool
@@ -194,6 +195,18 @@ func New(options Options) (*Box, error) {
 	service.MustRegister[adapter.ConnectionManager](ctx, connectionManager)
 	router := route.NewRouter(ctx, logFactory, routeOptions, dnsOptions)
 	service.MustRegister[adapter.Router](ctx, router)
+	if debugOptions.Prometheus != nil && debugOptions.Prometheus.Listen != "" {
+		exporter, err := metricsPrometheus.NewExporter(
+			logFactory.NewLogger("metrics/prometheus"),
+			*debugOptions.Prometheus,
+		)
+		if err != nil {
+			return nil, E.Cause(err, "initialize prometheus exporter")
+		}
+		router.AppendTracker(exporter.ConnectionTracker())
+		dnsRouter.AppendDNSTracker(exporter.DNSTracker())
+		internalServices = append(internalServices, adapter.NewLifecycleService(exporter, "prometheus metrics exporter"))
+	}
 	err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
 	if err != nil {
 		return nil, E.Cause(err, "initialize router")

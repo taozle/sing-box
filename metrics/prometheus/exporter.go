@@ -1,134 +1,76 @@
 package prometheus
 
 import (
-	"errors"
-	"net"
 	"net/http"
-	"runtime"
-	"strings"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
+	promlib "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-
 	"github.com/sagernet/sing-box/adapter"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-const (
-	defaultListenAddr  = "127.0.0.1:9090"
-	defaultMetricsPath = "/metrics"
-)
-
 type Exporter struct {
-	logger   log.ContextLogger
-	options  option.PrometheusOptions
-	registry *prometheus.Registry
-	server   *http.Server
-	listener net.Listener
+	logger     log.ContextLogger
+	options    option.PrometheusOptions
+	registry   *promlib.Registry
+	handler    http.Handler
+	tracker    *metricsTracker
+	dnsTracker *dnsTracker
+	httpServer *http.Server
 }
 
-func NewExporter(logger log.ContextLogger, router adapter.Router, dnsRouter adapter.DNSRouter, options option.PrometheusOptions) (*Exporter, error) {
-	listen := strings.TrimSpace(options.Listen)
-	if listen == "" {
-		listen = defaultListenAddr
-	}
-	path := strings.TrimSpace(options.Path)
-	if path == "" {
-		path = defaultMetricsPath
-	}
-	if !strings.HasPrefix(path, "/") {
-		path = "/" + path
-	}
-
-	registry := prometheus.NewRegistry()
-	if !options.DisableProcessCollector {
-		registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	}
-	if !options.DisableGoCollector {
-		registry.MustRegister(collectors.NewGoCollector())
-	}
-
-	connectionMetrics := newMetricsSet(registry)
+func NewExporter(logger log.ContextLogger, options option.PrometheusOptions) (*Exporter, error) {
+	registry := promlib.NewRegistry()
+	metrics := newMetricsSet(registry)
 	dnsMetrics := newDNSMetricsSet(registry)
-
-	buildInfo := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "sing_box",
-		Name:      "build_info",
-		Help:      "Build information about the running sing-box instance.",
-	}, []string{"version", "go_version"})
-	buildInfo.WithLabelValues(C.Version, runtime.Version()).Set(1)
-	registry.MustRegister(buildInfo)
-
-	tracker := newTracker(connectionMetrics)
-	if router == nil {
-		return nil, E.New("missing router in context")
-	}
-	router.AppendTracker(tracker)
-
-	if dnsRouter == nil {
-		return nil, E.New("missing DNS router in context")
-	}
-	dnsRouter.AppendDNSTracker(newDNSTracker(dnsMetrics))
-
-	mux := http.NewServeMux()
-	mux.Handle(path, promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
-
 	exporter := &Exporter{
-		logger:   logger,
-		options:  option.PrometheusOptions{Listen: listen, Path: path, DisableProcessCollector: options.DisableProcessCollector, DisableGoCollector: options.DisableGoCollector},
-		registry: registry,
-		server: &http.Server{
-			Addr:    listen,
-			Handler: mux,
-		},
+		logger:     logger,
+		options:    options,
+		registry:   registry,
+		handler:    promhttp.HandlerFor(registry, promhttp.HandlerOpts{}),
+		tracker:    newTracker(metrics),
+		dnsTracker: newDNSTracker(dnsMetrics),
 	}
 	return exporter, nil
 }
 
+func (e *Exporter) ConnectionTracker() adapter.ConnectionTracker {
+	return e.tracker
+}
+
+func (e *Exporter) DNSTracker() adapter.DNSTracker {
+	return e.dnsTracker
+}
+
 func (e *Exporter) Start() error {
-	if e.server == nil {
+	if e.options.Listen == "" {
 		return nil
 	}
-	listener, err := net.Listen("tcp", e.options.Listen)
-	if err != nil {
-		return err
+	path := e.options.Path
+	if path == "" {
+		path = "/metrics"
 	}
-	e.listener = listener
+	mux := http.NewServeMux()
+	mux.Handle(path, e.handler)
+	e.httpServer = &http.Server{
+		Addr:    e.options.Listen,
+		Handler: mux,
+	}
 	go func() {
-		if err := e.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		err := e.httpServer.ListenAndServe()
+		if err != nil && !E.IsClosed(err) {
 			e.logger.Error("serve prometheus metrics: ", err)
 		}
 	}()
-	e.logger.Info("prometheus metrics exporter listening on ", e.options.Listen, " path ", e.options.Path)
+	e.logger.Info("prometheus metrics exporter listening on ", e.options.Listen, " path ", path)
 	return nil
 }
 
 func (e *Exporter) Close() error {
-	return common.Close(
-		common.Closer(func() error {
-			if e.server == nil {
-				return nil
-			}
-			err := e.server.Close()
-			if err != nil && !errors.Is(err, http.ErrServerClosed) {
-				return err
-			}
-			return nil
-		}),
-		common.Closer(func() error {
-			if e.listener == nil {
-				return nil
-			}
-			return e.listener.Close()
-		}),
-	)
-}
-
-func (e *Exporter) Upstream() any {
-	return e.registry
+	if e.httpServer == nil {
+		return nil
+	}
+	return e.httpServer.Close()
 }
