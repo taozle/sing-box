@@ -4,6 +4,7 @@ import "github.com/sagernet/sing/common/byteformats"
 
 type DebugOptions struct {
 	Listen       string                   `json:"listen,omitempty"`
+	Prometheus   *PrometheusOptions       `json:"prometheus,omitempty"`
 	GCPercent    *int                     `json:"gc_percent,omitempty"`
 	MaxStack     *int                     `json:"max_stack,omitempty"`
 	MaxThreads   *int                     `json:"max_threads,omitempty"`
