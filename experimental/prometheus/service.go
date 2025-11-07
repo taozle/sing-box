@@ -21,15 +21,12 @@ import (
 )
 
 var (
-	_ adapter.LifecycleService  = (*Service)(nil)
-	_ adapter.ConnectionTracker = (*Service)(nil)
+	_ adapter.PrometheusService = (*Service)(nil)
 )
 
 type Service struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
-	server    *http.Server
-	listener  net.Listener
 	createdAt time.Time
 
 	inbounds  map[string]bool
@@ -40,14 +37,15 @@ type Service struct {
 	counters map[string]*atomic.Int64
 
 	// Prometheus metrics
-	trafficBytes    *prometheus.CounterVec
-	connectionsTotal prometheus.Counter
+	trafficBytes      *prometheus.CounterVec
+	connectionsTotal  prometheus.Counter
 	activeConnections *prometheus.GaugeVec
-	uptime          prometheus.Gauge
-	goroutines      prometheus.Gauge
-	memAlloc        prometheus.Gauge
-	memSys          prometheus.Gauge
-	gcRuns          prometheus.Gauge
+	dnsQueries        *prometheus.CounterVec
+	uptime            prometheus.Gauge
+	goroutines        prometheus.Gauge
+	memAlloc          prometheus.Gauge
+	memSys            prometheus.Gauge
+	gcRuns            prometheus.Gauge
 
 	registry *prometheus.Registry
 }
@@ -55,10 +53,6 @@ type Service struct {
 func NewService(ctx context.Context, options option.PrometheusOptions) (*Service, error) {
 	if !options.Enabled {
 		return nil, nil
-	}
-
-	if options.Listen == "" {
-		return nil, E.New("prometheus listen address is required")
 	}
 
 	inbounds := make(map[string]bool)
@@ -145,11 +139,20 @@ func NewService(ctx context.Context, options option.PrometheusOptions) (*Service
 		},
 	)
 
+	service.dnsQueries = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "singbox_dns_queries_total",
+			Help: "Total number of DNS queries",
+		},
+		[]string{"transport", "domain", "type", "status"},
+	)
+
 	// Register metrics
 	registry.MustRegister(
 		service.trafficBytes,
 		service.connectionsTotal,
 		service.activeConnections,
+		service.dnsQueries,
 		service.uptime,
 		service.goroutines,
 		service.memAlloc,
@@ -157,20 +160,7 @@ func NewService(ctx context.Context, options option.PrometheusOptions) (*Service
 		service.gcRuns,
 	)
 
-	listener, err := net.Listen("tcp", options.Listen)
-	if err != nil {
-		return nil, E.Cause(err, "listen prometheus")
-	}
-
 	service.ctx, service.cancel = context.WithCancel(ctx)
-	service.listener = listener
-
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
-
-	service.server = &http.Server{
-		Handler: mux,
-	}
 
 	return service, nil
 }
@@ -191,14 +181,6 @@ func (s *Service) Start(stage adapter.StartStage) error {
 	// Start system stats collector
 	go s.collectSystemStats()
 
-	// Start HTTP server
-	go func() {
-		err := s.server.Serve(s.listener)
-		if err != nil && err != http.ErrServerClosed {
-			// Log error if needed
-		}
-	}()
-
 	return nil
 }
 
@@ -208,14 +190,15 @@ func (s *Service) Close() error {
 	}
 
 	s.cancel()
-
-	if s.server != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		return s.server.Shutdown(ctx)
-	}
-
 	return nil
+}
+
+// Handler returns the HTTP handler for Prometheus metrics endpoint
+func (s *Service) Handler() http.Handler {
+	if s == nil {
+		return http.NotFoundHandler()
+	}
+	return promhttp.HandlerFor(s.registry, promhttp.HandlerOpts{})
 }
 
 func (s *Service) collectSystemStats() {
@@ -460,4 +443,17 @@ func (c *trackedPacketConn) Close() error {
 		}).Dec()
 	})
 	return c.PacketConn.Close()
+}
+
+// RecordDNSQuery records a DNS query in metrics
+func (s *Service) RecordDNSQuery(transport string, domain string, qType string, status string) {
+	if s == nil {
+		return
+	}
+	s.dnsQueries.With(prometheus.Labels{
+		"transport": transport,
+		"domain":    domain,
+		"type":      qType,
+		"status":    status,
+	}).Inc()
 }

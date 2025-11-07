@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"net/http"
 	"time"
 
 	"github.com/sagernet/sing/common/varbin"
@@ -33,6 +34,13 @@ type URLTestHistoryStorage interface {
 type V2RayServer interface {
 	LifecycleService
 	StatsService() ConnectionTracker
+}
+
+type PrometheusService interface {
+	LifecycleService
+	ConnectionTracker
+	Handler() http.Handler
+	RecordDNSQuery(transport string, domain string, qType string, status string)
 }
 
 type CacheFile interface {

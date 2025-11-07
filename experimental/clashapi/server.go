@@ -128,6 +128,12 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/cache", cacheRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
 
+		// Prometheus metrics endpoint
+		prometheusService := service.FromContext[adapter.PrometheusService](ctx)
+		if prometheusService != nil {
+			r.Handle("/metrics", prometheusService.Handler())
+		}
+
 		s.setupMetaAPI(r)
 	})
 	if options.ExternalUI != "" {

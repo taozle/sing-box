@@ -8,6 +8,6 @@ import (
 	"github.com/sagernet/sing-box/option"
 )
 
-func NewPrometheusService(ctx context.Context, options option.PrometheusOptions) (adapter.LifecycleService, error) {
+func NewPrometheusService(ctx context.Context, options option.PrometheusOptions) (adapter.PrometheusService, error) {
 	return prometheus.NewService(ctx, options)
 }

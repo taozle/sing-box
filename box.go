@@ -376,6 +376,7 @@ func New(options Options) (*Box, error) {
 		if prometheusService != nil {
 			router.AppendTracker(prometheusService)
 			internalServices = append(internalServices, prometheusService)
+			service.MustRegister[adapter.PrometheusService](ctx, prometheusService)
 		}
 	}
 	if ntpOptions.Enabled {
