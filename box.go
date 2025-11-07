@@ -130,6 +130,7 @@ func New(options Options) (*Box, error) {
 	var needCacheFile bool
 	var needClashAPI bool
 	var needV2RayAPI bool
+	var needPrometheus bool
 	if experimentalOptions.CacheFile != nil && experimentalOptions.CacheFile.Enabled || options.PlatformLogWriter != nil {
 		needCacheFile = true
 	}
@@ -138,6 +139,9 @@ func New(options Options) (*Box, error) {
 	}
 	if experimentalOptions.V2RayAPI != nil && experimentalOptions.V2RayAPI.Listen != "" {
 		needV2RayAPI = true
+	}
+	if experimentalOptions.Prometheus != nil && experimentalOptions.Prometheus.Enabled {
+		needPrometheus = true
 	}
 	platformInterface := service.FromContext[platform.Interface](ctx)
 	var defaultLogWriter io.Writer
@@ -362,6 +366,16 @@ func New(options Options) (*Box, error) {
 			router.AppendTracker(v2rayServer.StatsService())
 			internalServices = append(internalServices, v2rayServer)
 			service.MustRegister[adapter.V2RayServer](ctx, v2rayServer)
+		}
+	}
+	if needPrometheus {
+		prometheusService, err := experimental.NewPrometheusService(ctx, common.PtrValueOrDefault(experimentalOptions.Prometheus))
+		if err != nil {
+			return nil, E.Cause(err, "create prometheus service")
+		}
+		if prometheusService != nil {
+			router.AppendTracker(prometheusService)
+			internalServices = append(internalServices, prometheusService)
 		}
 	}
 	if ntpOptions.Enabled {
