@@ -32,9 +32,7 @@
       "secret": ""
     },
     "prometheus": {
-      "enabled": true,
-      "inbounds": ["socks-in", "http-in"],
-      "outbounds": ["direct", "block"]
+      "enabled": true
     }
   }
 }

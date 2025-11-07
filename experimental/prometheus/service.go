@@ -29,10 +29,6 @@ type Service struct {
 	cancel    context.CancelFunc
 	createdAt time.Time
 
-	inbounds  map[string]bool
-	outbounds map[string]bool
-	users     map[string]bool
-
 	access   sync.Mutex
 	counters map[string]*atomic.Int64
 
@@ -55,27 +51,10 @@ func NewService(ctx context.Context, options option.PrometheusOptions) (*Service
 		return nil, nil
 	}
 
-	inbounds := make(map[string]bool)
-	outbounds := make(map[string]bool)
-	users := make(map[string]bool)
-
-	for _, inbound := range options.Inbounds {
-		inbounds[inbound] = true
-	}
-	for _, outbound := range options.Outbounds {
-		outbounds[outbound] = true
-	}
-	for _, user := range options.Users {
-		users[user] = true
-	}
-
 	registry := prometheus.NewRegistry()
 
 	service := &Service{
 		createdAt: time.Now(),
-		inbounds:  inbounds,
-		outbounds: outbounds,
-		users:     users,
 		counters:  make(map[string]*atomic.Int64),
 		registry:  registry,
 	}
@@ -303,24 +282,16 @@ func (s *Service) RoutedConnection(ctx context.Context, conn net.Conn, metadata 
 	var readCounter []*atomic.Int64
 	var writeCounter []*atomic.Int64
 
-	countInbound := inbound != "" && (len(s.inbounds) == 0 || s.inbounds[inbound])
-	countOutbound := outbound != "" && (len(s.outbounds) == 0 || s.outbounds[outbound])
-	countUser := user != "" && (len(s.users) == 0 || s.users[user])
-
-	if !countInbound && !countOutbound && !countUser {
-		return conn
-	}
-
 	s.access.Lock()
-	if countInbound {
+	if inbound != "" {
 		readCounter = append(readCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>uplink"))
 		writeCounter = append(writeCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>downlink"))
 	}
-	if countOutbound {
+	if outbound != "" {
 		readCounter = append(readCounter, s.loadOrCreateCounter("outbound>>>"+outbound+">>>traffic>>>uplink"))
 		writeCounter = append(writeCounter, s.loadOrCreateCounter("outbound>>>"+outbound+">>>traffic>>>downlink"))
 	}
-	if countUser {
+	if user != "" {
 		readCounter = append(readCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>uplink"))
 		writeCounter = append(writeCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>downlink"))
 	}
@@ -356,24 +327,16 @@ func (s *Service) RoutedPacketConnection(ctx context.Context, conn N.PacketConn,
 	var readCounter []*atomic.Int64
 	var writeCounter []*atomic.Int64
 
-	countInbound := inbound != "" && (len(s.inbounds) == 0 || s.inbounds[inbound])
-	countOutbound := outbound != "" && (len(s.outbounds) == 0 || s.outbounds[outbound])
-	countUser := user != "" && (len(s.users) == 0 || s.users[user])
-
-	if !countInbound && !countOutbound && !countUser {
-		return conn
-	}
-
 	s.access.Lock()
-	if countInbound {
+	if inbound != "" {
 		readCounter = append(readCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>uplink"))
 		writeCounter = append(writeCounter, s.loadOrCreateCounter("inbound>>>"+inbound+">>>traffic>>>downlink"))
 	}
-	if countOutbound {
+	if outbound != "" {
 		readCounter = append(readCounter, s.loadOrCreateCounter("outbound>>>"+outbound+">>>traffic>>>uplink"))
 		writeCounter = append(writeCounter, s.loadOrCreateCounter("outbound>>>"+outbound+">>>traffic>>>downlink"))
 	}
-	if countUser {
+	if user != "" {
 		readCounter = append(readCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>uplink"))
 		writeCounter = append(writeCounter, s.loadOrCreateCounter("user>>>"+user+">>>traffic>>>downlink"))
 	}
